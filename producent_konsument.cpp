@@ -1,5 +1,24 @@
-//g++ -lpthread save.cpp
-#include <stdio.h>          /* printf()                 */
+
+
+/**
+ * compilation: g++ -pthread semafory.cpp
+ *
+ * This is an example of a classic producer-consumer problem.
+ * We have 2 conveyor belts. There are two processes that each 
+ * create Objects of a different type and put them on the first 
+ * conveyor belt, and a few (user decides how many) processes 
+ * that color Objects they picked up from the first conveyor
+ * belt and put them on the second. Form there, Objects are 
+ * picked up by a reading thred.
+ * The 'difficulty' is, a set number of Objects is to be created
+ * and all of them have to be consumed, and then all processes 
+ * have to end on their own.  
+ *
+ * The two producent processes create Objects of two different 
+ * types. The consumer processes color Objects each into different 
+ * colors (represented by an int).
+ */
+#include <stdio.h>          /* printf(), because it is atomic */
 #include <iostream>         /* new, delete              */
 #include <stdlib.h>         /* exit(), malloc(), free() */
 #include <sys/types.h>      /* key_t, sem_t, pid_t      */
@@ -9,307 +28,252 @@
 #include <fcntl.h>          /* O_CREAT, O_EXEC          */
 #include <unistd.h>
 #include <sys/wait.h>
-#define N 5 //zadana dlugosc tasmy
+#define N 5 // conveyor belt length
+#define M 20 // number of Objects to be produced
 
-class Przedmiot 
-{
-public:
-    static int ilosc; //TEN LICZNIK NIE JEST WSPOLDZIELONY wiec kazda instancja procesu tworzacego liczy sobie. tak tylko, orientacyjnie.
-    int nr;
-    int kolor;
-    char typ;
-    Przedmiot(): typ('a'), nr(-1), kolor(-1) {};
-    Przedmiot(char t): typ(t), nr(ilosc) { ilosc += 1; };
-    void koloruj(int i) { kolor = i; };
+
+
+enum ObjectType {
+  first_type,
+  second_type,
+  invalid
 };
 
-int Przedmiot::ilosc = 0;
 
-class Kolejka
+
+class Object 
+{
+private:
+  Object() { type = invalid; };
+public:
+  int color;
+  ObjectType type;
+  Object(ObjectType t): type(t) {};
+  void set_color(int c) { color = c; };
+};
+
+
+
+class FIFO
 {
 public:
-    Przedmiot tasma[N];
+    Object conveyor_belt[N];
     int in;
     int out;
 
-    void add(Przedmiot *p) //nie tworzymy & usuwamy instancji Przedmiotu. zamiast tego, odbijamy je na Tasmie (przedmioty nie sa wspoldzielone,
-    {                     //wiec rozne procesy nie moglyby ich tworzyc & kasowac)
+    void add_object(Object *p) // we do not create & delete Objects, because they are not shared; 
+                               // instead we change properties of existing objects
+    {
         in = (in + 1) % N;
-        tasma[in].typ = p->typ;
-        tasma[in].kolor = p->kolor;
-        tasma[in].nr = p->nr;
+        conveyor_belt[in].type = p->type;
+        conveyor_belt[in].color = p->color;
     };
 
-    void read(int count) 
+    Object remove_object() 
     {
-      printf("\n%d) Z tasma[%d]: nr: %d, typ: %c, kolor: %d\n\n", count, out, tasma[out].nr, tasma[out].typ, tasma[out].kolor); //bo cout nie jest atomowe
+      int o = out;
       out = (out + 1) % N;
-    };
+      return conveyor_belt[o];
+    }
 };
 
+
+
+class ProducerProcess 
+{
+private:
+  Object *item;
+public:
+  ProducerProcess(ObjectType type) { item = new Object(type); };
+  ~ProducerProcess() { delete item; };
+
+  void run(FIFO *conveyor_belt, sem_t *full_slots, sem_t *empty_slots, sem_t *mutex) 
+  {
+    while (true)
+    {
+      sem_wait(empty_slots); 
+      sem_wait (mutex);         
+
+      sem_post(full_slots);
+      sem_post (mutex);
+    }
+  }
+};
+
+
+
+class ColoringProcess 
+{
+private:
+  int color;
+public:
+  ColoringProcess(int c): color(c) {};
+
+  void run(FIFO *conveyor_belt_A, sem_t *full_slots_A, sem_t *empty_slots_A, sem_t *mutex_A,
+           FIFO *conveyor_belt_B, sem_t *full_slots_B, sem_t *empty_slots_B, sem_t *mutex_B) 
+  {
+    while (true)
+    { 
+      sem_wait(full_slots_A);
+      sem_wait(mutex_A);
+
+      sem_post(empty_slots_A);
+      sem_post (mutex_A);         
+
+      sem_wait(empty_slots_B);
+      sem_wait (mutex_B);           
+
+      sem_post(full_slots_B);
+      sem_post (mutex_B);       
+    }
+  }
+};
+
+
+
+class ReadingProcess 
+{
+public:
+  ReadingProcess() {};
+
+  void run(FIFO *conveyor_belt, sem_t *full_slots, sem_t *empty_slots, sem_t *mutex) 
+  {
+    while (true)
+    {
+      sem_wait(full_slots); 
+      sem_wait (mutex);         
+
+      sem_post(empty_slots);
+      sem_post (mutex);
+    }
+  }
+};
 
 
 
 int main (int argc, char **argv)
 {
-    int i;
-    key_t shmkey;                 /*      shared memory key       */
-    int shmid;                    /*      shared memory id        */
-    sem_t *mutex_A, *wolne_A, *pelne_A, *mutex_B, *wolne_B, *pelne_B;
-    sem_t *tworzace_end, *mutex_tworzace_end, *kolorujace_end, *mutex_kolorujace_end, *il_wprocesie;
-    pid_t pid;                    /*      fork pid                */
-    Kolejka *tasma_A, *tasma_B;   /*      shared variable         */
-    unsigned int n;               /*      fork count              */
-
+    sem_t *mutex_A, *empty_slots_A, *full_slots_A, *mutex_B, *empty_slots_B, *full_slots_B;
+    sem_t *all_produced_counter, *mutex_all_produced, *all_colored_counter, *mutex_all_colored, *all_read_counter;
+    ReadingProcess *reading_process;
+    ProducerProcess *producer_process;
+    ColoringProcess *coloring_process;
+    pid_t pid; // fork pid
 
     /* initialize a shared variable in shared memory */
-    shmkey = ftok ("/dev/null", 597999); /* valid directory name and a number */
-    printf ("shmkey for tasma_A = %d\n", shmkey);
-    shmid = shmget (shmkey, 2*sizeof (Kolejka), 0644 | IPC_CREAT);
-    if (shmid < 0) 
-    { /* shared memory error check */
+    key_t shared_memory_key = ftok ("/dev/null", 597999); // valid directory name and a number 
+    printf ("shared_memory_key for conveyor belts = %d\n", shared_memory_key);
+    int shared_memory_id = shmget (shared_memory_key, 2*sizeof (FIFO), 0644 | IPC_CREAT);
+    if (shared_memory_id < 0) // shared memory error check
+    { 
         perror ("shmget\n");
         exit (1);
     }
-
-    tasma_A = (Kolejka *) shmat (shmid, NULL, 0); /* attach p to shared memory */
-    tasma_B = tasma_A+1;
-    tasma_A->in = -1;
-    tasma_A->out = 0;
-    tasma_B->in = -1;
-    tasma_B->out = 0;
-    printf ("tasma_A, tasma_B, %d is allocated in shared memory.\n\n", tasma_B->in);
+    FIFO *conveyor_belt_A = (FIFO *) shmat (shared_memory_id, NULL, 0); // attach shared variables to shared memory 
+    FIFO *conveyor_belt_B = conveyor_belt_A+1;
+    conveyor_belt_A->in = -1;
+    conveyor_belt_A->out = 0;
+    conveyor_belt_B->in = -1;
+    conveyor_belt_B->out = 0;
+    printf ("conveyor belts allocated in shared memory.\n");
 
     /********************************************************/
-
-    printf ("How many children do you want to fork?\n");
-    printf ("Fork count: ");
-    scanf ("%u", &n);
-
+    unsigned int coloring_thread_count = 0; 
+    while (coloring_thread_count < 1) 
+    {
+      printf ("How many coloring processes do you want?\n");
+      scanf ("%u", &coloring_thread_count);
+    }
     /* initialize semaphores for shared processes */
     errno = 0; 
-    if ((wolne_A = sem_open ("/wolne_A", O_CREAT | O_EXCL, 0644, N)) == SEM_FAILED) //przedstawia ilosc wolnych miejsc
+    if ((empty_slots_B = sem_open ("/empty_slots_B", O_CREAT | O_EXCL, 0644, N)) == SEM_FAILED) //przedstawia counter wolnych miejsc
         fprintf(stderr, "sem_open() failed.  errno:%d\n", errno); //zwykle jak juz jeden wyjdzie to reszta tez.
     mutex_A = sem_open ("/mutex_A", O_CREAT | O_EXCL, 0644, 1); 
-    pelne_A = sem_open ("/pelne_A", O_CREAT | O_EXCL, 0644, 0);
+    full_slots_B = sem_open ("/full_slots_B", O_CREAT | O_EXCL, 0644, 0);
 
-    wolne_B = sem_open ("/wolne_B", O_CREAT | O_EXCL, 0644, N);
+    empty_slots_B = sem_open ("/empty_slots_B", O_CREAT | O_EXCL, 0644, N);
     mutex_B = sem_open ("/mutex_B", O_CREAT | O_EXCL, 0644, 1); 
-    pelne_B = sem_open ("/pelne_B", O_CREAT | O_EXCL, 0644, 0);
+    full_slots_B = sem_open ("/full_slots_B", O_CREAT | O_EXCL, 0644, 0);
 
-    tworzace_end = sem_open ("/tworzace_end", O_CREAT | O_EXCL, 0644, 10);
-    mutex_tworzace_end = sem_open ("/mutex_tworzace_end", O_CREAT | O_EXCL, 0644, 1);
-    kolorujace_end = sem_open ("/kolorujace_end", O_CREAT | O_EXCL, 0644, 2);
-    mutex_kolorujace_end = sem_open ("/mutex_kolorujace_end", O_CREAT | O_EXCL, 0644, 1);
-    il_wprocesie = sem_open ("/il_wprocesie", O_CREAT | O_EXCL, 0644, 0);
+    all_produced_counter = sem_open ("/all_produced_counter", O_CREAT | O_EXCL, 0644, 10);
+    mutex_all_produced = sem_open ("/mutex_all_produced", O_CREAT | O_EXCL, 0644, 1);
+    all_colored_counter = sem_open ("/all_colored_counter", O_CREAT | O_EXCL, 0644, 2);
+    mutex_all_colored = sem_open ("/mutex_all_colored", O_CREAT | O_EXCL, 0644, 1);
+    all_read_counter = sem_open ("/all_read_counter", O_CREAT | O_EXCL, 0644, 0);
 
-    sem_unlink ("/wolne_A");   
+    sem_unlink ("/empty_slots_B");   
     sem_unlink ("/mutex_A");  
-    sem_unlink ("/pelne_A");  
-    sem_unlink ("/wolne_B");   
+    sem_unlink ("/full_slots_B");  
+    sem_unlink ("/empty_slots_B");   
     sem_unlink ("/mutex_B");  
-    sem_unlink ("/pelne_B");   
+    sem_unlink ("/full_slots_B");   
 
-    sem_unlink ("/tworzace_end"); 
-    sem_unlink ("/mutex_tworzace_end");    
-    sem_unlink ("/kolorujace_end"); 
-    sem_unlink ("/mutex_kolorujace_end"); 
-    sem_unlink ("/il_wprocesie"); 
-    /* unlink prevents the semaphore existing forever */
-    /* if a crash occurs during the execution         */
+    sem_unlink ("/all_produced_counter"); 
+    sem_unlink ("/mutex_all_produced");    
+    sem_unlink ("/all_colored_counter"); 
+    sem_unlink ("/mutex_all_colored"); 
+    sem_unlink ("/all_read_counter"); 
+    // unlink prevents the semaphore existing forever if a crash occurs during the execution         
     printf ("semaphores initialized.\n\n");
 
-
-    /* fork child processes */
-    for (i = 0; i < n; i++){
+    // fork child processes 
+    int process_num = 0;
+    for ( ; process_num < coloring_thread_count + 3; process_num++){
         pid = fork();
-        if (pid < 0)                /* check for error      */
+        if (pid < 0) 
             printf ("Fork error.\n");
         else if (pid == 0)
-            break;                  /* child processes */
+            break; // child process breaks and its process_num stays frozen
     }
 
-
-    /******************************************************/
     /******************   PARENT PROCESS   ****************/
-    /******************************************************/
     if (pid != 0)
     {
       printf ("\nParent: waiting for all children to exit.\n\n");
-
         while (pid = waitpid (-1, NULL, 0))
         {
             if (errno == ECHILD)
                 break;
         }
-
         printf ("\nParent: All children have exited.\n");
-
-        /* shared memory detach */
-        shmdt (tasma_A);
-        shmdt (tasma_B);
-        shmctl (shmid, IPC_RMID, 0);
-
-        /* cleanup semaphores */
+        // shared memory detach
+        shmdt (conveyor_belt_A);
+        shmdt (conveyor_belt_B);
+        shmctl (shared_memory_id, IPC_RMID, 0);
+        // cleanup semaphores 
         sem_destroy (mutex_A);
-        sem_destroy (wolne_A);
-        sem_destroy (pelne_A);
+        sem_destroy (empty_slots_B);
+        sem_destroy (full_slots_B);
         sem_destroy (mutex_B);
-        sem_destroy (wolne_B);
-        sem_destroy (pelne_B);
-        sem_destroy (tworzace_end); 
-        sem_destroy (mutex_tworzace_end);    
-        sem_destroy (kolorujace_end); 
-        sem_destroy (mutex_kolorujace_end); 
-        sem_destroy (il_wprocesie); 
+        sem_destroy (empty_slots_B);
+        sem_destroy (full_slots_B);
+        sem_destroy (all_produced_counter); 
+        sem_destroy (mutex_all_produced);    
+        sem_destroy (all_colored_counter); 
+        sem_destroy (mutex_all_colored); 
+        sem_destroy (all_read_counter); 
         exit (0);
     }
-
-    /******************************************************/
     /******************   CHILD PROCESS   *****************/
-    /******************************************************/
     else
-      switch (i)
+      switch (process_num)
       {
-/********************************************************************************/
-/******************************* PROCES CZYTAJACY *******************************/
-/********************************************************************************/
         case 0: 
-        {
-          int a, il = 0;
-          while (1) 
-          { 
-            //
-            sem_getvalue(tworzace_end, &a);
-            if (a == 0) 
-            {
-                sem_getvalue(il_wprocesie, &a);
-                if (il == a) 
-                {
-                    printf ("\t\t\t\tczytacz wyszedl\n");
-                    exit(0);
-                };
-            };
-            sem_wait(pelne_B); 
-            //
-
-                  sem_wait (mutex_B);
-                        printf ("czytacz\t wchodzi do B\n");
-                        tasma_B->read(il);
-                        il += 1;
-            sem_post (wolne_B); 
-                        printf ("czytacz\t  opuszcza  B\n");
-                  sem_post (mutex_B);  
-          } 
-        }
-/***************************************************************************************************/
-/******************************* PROCES TWORZACY PRZEDMIOTY TYPU 'R' *******************************/
-/***************************************************************************************************/
-        case 1: 
-        {
-          int b;
-          Przedmiot *p;
-
-          do
-          {
-            sem_wait(wolne_A); //stad sie wszystko zaczyna!
-                  sem_wait (mutex_A);         
-                        printf ("\ttworca R\t wchodzi do A\n");
-                        p = new Przedmiot('R');
-                        sleep (1);
-                        tasma_A->add(p);
-                        sem_post(il_wprocesie);
-                        delete p;
-            sem_post(pelne_A); //post() & wait() operations are ATOMIC
-                        printf ("\ttworca R\t  opuszcza  A\n");
-                  sem_post (mutex_A);
-
-
-            sem_wait(mutex_tworzace_end);
-                  sem_getvalue(tworzace_end, &b);
-                  if (b > 0) sem_wait(tworzace_end);
-                  b -= 1;
-            sem_post(mutex_tworzace_end);
-          } while (b); //wciaz moze sie zdarzyc ze wyprodukowany zostanie o 1 wiecej Przedmiot
-
-          sem_wait(kolorujace_end);
-          printf ("\t\t\t\ttworca R wyszedl\n");
-          exit (0);
-        }
-/***************************************************************************************************/
-/******************************* PROCES TWORZACY PRZEDMIOTY TYPU 'P' *******************************/
-/***************************************************************************************************/
-        case 2:
-        {
-          int c;
-          Przedmiot *p;
-
-          do
-          {
-            sem_wait(wolne_A);
-                  sem_wait (mutex_A);           
-                        printf ("\ttworca P\t wchodzi do A\n");
-                        p = new Przedmiot('P');
-                        sleep (1);
-                        tasma_A->add(p);
-                        sem_post(il_wprocesie);
-                        delete p;
-            sem_post(pelne_A);
-                        printf ("\ttworca P\t  opuszcza  A\n");
-                  sem_post (mutex_A); 
-
-
-            sem_wait(mutex_tworzace_end);
-                  sem_getvalue(tworzace_end, &c);
-                  if (c > 0) sem_wait(tworzace_end);
-                  c -= 1;
-            sem_post(mutex_tworzace_end);
-          } while(c);
-
-          sem_wait(kolorujace_end);
-          printf ("\t\t\t\ttworca P wyszedl\n");
-          exit (0);
-        }
-/**********************************************************************************/
-/******************************* PROCESY KOLORUJACE *******************************/
-/**********************************************************************************/
+          reading_process = new ReadingProcess();
+          reading_process->run(conveyor_belt_B, full_slots_B, empty_slots_B, mutex_B);
+          delete reading_process;
+          break;
+        case 1:
+        case 2: 
+          producer_process = new ProducerProcess(static_cast<ObjectType> (process_num-1));
+          producer_process->run(conveyor_belt_A, full_slots_A, empty_slots_A, mutex_A);
+          delete producer_process;
+          break;
         default: 
-        {
-          int d, notall;
-          Przedmiot p;
-
-          do 
-          { 
-
-
-                sem_wait(pelne_A);
-
-
-          printf ("\tkolorujacy %d\t wchodzi do A\n", i);
-          sleep (1);
-          
-          p.typ = tasma_A->tasma[tasma_A->out].typ;
-          p.nr = tasma_A->tasma[tasma_A->out].nr;
-          tasma_A->out = (tasma_A->out + 1) % N;
-          sem_post(wolne_A);
-          printf ("\tkolorujacy %d\t  opuszcza  A\n", i);
-          sem_post (mutex_A);         
-
-          //zrob cos dalej z tym co wziales
-          p.koloruj(i);
-            sem_wait(wolne_B);
-            sem_wait (mutex_B);           
-            printf ("kolorujacy %d\t wchodzi do B\n", i);
-            sleep (1);
-            tasma_B->add(&p);
-            sem_post(pelne_B);
-            printf ("kolorujacy %d\t  opuszcza  B\n", i);
-            sem_post (mutex_B);       
-
-          } while (1);
-
-          printf ("\t\t\t\tkolorujacy %d wyszedl\n", i);
-          exit(0);
-        };     
+          coloring_process = new ColoringProcess(process_num-3);
+          coloring_process->run(conveyor_belt_A, full_slots_A, empty_slots_A, mutex_A,
+                                conveyor_belt_B, full_slots_B, empty_slots_B, mutex_B);
+          delete coloring_process;
       }
+
 }
