@@ -30,7 +30,7 @@
 #include <sys/wait.h>
 #define N 5 // conveyor belt length
 #define M 10 // number of Objects to be produced
-#define SLEEPY_TIME 3
+#define SLEEPY_TIME 1
 
 
 
@@ -44,15 +44,17 @@ enum ObjectType {
 
 class Object 
 {
-private:
+public:
   int number;
   int color;
   ObjectType type;
-  Object() { type = invalid; };
-public:
-  Object(ObjectType t): type(t) {};
-  void set_number(int n) { number = n; };
-  void set_color(int c) { color = c; };
+
+  void copy(Object &obj) 
+  {
+    this->type = obj.type;
+    this->color = obj.color;
+    this->number = obj.number;
+  }
 };
 
 
@@ -63,35 +65,36 @@ public:
     Object conveyor_belt[N];
     int in;
     int out;
-    void add_object(Object *p) // we do not create & delete Objects, because they are not shared; 
-                               // instead we change properties of existing objects
+    void add_object(Object &obj) // we do not create & delete Objects, because they are not shared; 
+                                 // instead we change properties of existing objects
     {
-        in = (in + 1) % N;
-        conveyor_belt[in].type = p->type;
-        conveyor_belt[in].color = p->color;
+      in = (in + 1) % N;
+      conveyor_belt[in].copy(obj);
+      Object item = conveyor_belt[in];
+      printf("Object nr %d, of type %d and color %d added to conveyor belt\n", item.number, item.type, item.color);
     };
-    Object remove_object() 
+    void remove_object(Object &obj) 
     {
-      int o = out;
+      obj.copy(conveyor_belt[out]);
+      Object item = conveyor_belt[out];
+      printf("Object nr %d, of type %d and color %d removed from conveyor belt\n", item.number, item.type, item.color);
       out = (out + 1) % N;
-      return conveyor_belt[o];
     }
 };
 
 
-
+  
 class ProducerProcess 
 {
 private:
-  Object *item;
+  Object item;
   sem_t *mutex_all;
   int *counter_all;
 public:
   ProducerProcess(ObjectType type, int *c, sem_t *m): counter_all(c), mutex_all(m)
   { 
-    item = new Object(type); 
+    item.type = type;
   };
-  ~ProducerProcess() { delete item; };
 
   void run(FIFO *conveyor_belt, sem_t *full_slots, sem_t *empty_slots, sem_t *mutex) 
   {
@@ -99,7 +102,10 @@ public:
     {
       sem_wait(mutex_all); // checking for end condition
       if (*counter_all > 0)
-        *counter_all--;
+      {
+        *counter_all = *counter_all - 1;
+        item.number = M - *counter_all;
+      }
       else
         break;
       sem_post(mutex_all);
@@ -107,7 +113,8 @@ public:
       sem_wait(empty_slots); 
       sem_wait (mutex);      
       sleep(rand() % SLEEPY_TIME);
-      printf("producer in A\n");
+      printf("Producer process in A\n");
+      conveyor_belt->add_object(item);
       sem_post(full_slots);
       sem_post (mutex);
     }
@@ -122,7 +129,7 @@ private:
   int color;
   sem_t *mutex_all;
   int *counter_all;
-  Object *item;
+  Object item;
 public:
   ColoringProcess(int color, int *c, sem_t *m): counter_all(c), mutex_all(m), color(color) {};
 
@@ -133,7 +140,7 @@ public:
     { 
       sem_wait(mutex_all); // checking for end condition
       if (*counter_all > 0)
-        *counter_all--;
+        *counter_all = *counter_all - 1;
       else
         break;
       sem_post(mutex_all);
@@ -141,14 +148,18 @@ public:
       sem_wait(full_slots_A);
       sem_wait(mutex_A);
       sleep(rand() % SLEEPY_TIME);
-      printf("colorer in A\n");
+      printf("Coloring process in A\n");
+      conveyor_belt_A->remove_object(item);
       sem_post(empty_slots_A);
-      sem_post (mutex_A);         
+      sem_post (mutex_A);      
+
+      item.color = color;   
 
       sem_wait(empty_slots_B);
       sem_wait (mutex_B);       
-      sleep(rand() % SLEEPY_TIME);    
-      printf("colorer in B\n");
+      sleep(rand() % SLEEPY_TIME);   
+      printf("Coloring process in B\n"); 
+      conveyor_belt_B->add_object(item);
       sem_post(full_slots_B);
       sem_post (mutex_B);       
     }
@@ -161,7 +172,7 @@ class ReadingProcess
 {
 private:
   int *counter_all;
-  Object *item;
+  Object item;
 public:
   ReadingProcess(int *c): counter_all(c) {};
 
@@ -170,15 +181,15 @@ public:
     while (true)
     {
       if (*counter_all > 0) // checking for end condition - there is only one process of this kind
-        *counter_all--;
+        *counter_all = *counter_all - 1;
       else
         break;
 
       sem_wait(full_slots); 
       sem_wait (mutex);         
       sleep(rand() % SLEEPY_TIME);
-      conveyor_belt->remove_object();
-      printf("Object nr %d, of type %c and color %c picked up from conveyor_belt_B\n", );
+      printf("Reading process in B\n");
+      conveyor_belt->remove_object(item);
       sem_post(empty_slots);
       sem_post (mutex);
     }
@@ -197,7 +208,7 @@ int main (int argc, char **argv)
     pid_t pid; // fork pid
 
     /* initialize a shared variable in shared memory */
-    key_t shared_memory_key = ftok ("/dev/null", 597994444); // valid directory name and a number 
+    key_t shared_memory_key = ftok ("/dev/null", 597); // valid directory name and a number 
     printf ("shared_memory_key for conveyor belts = %d\n", shared_memory_key);
     int shared_memory_id = shmget (shared_memory_key, 2*sizeof(FIFO) + 3*sizeof(int), 0644 | IPC_CREAT);
     if (shared_memory_id < 0)
